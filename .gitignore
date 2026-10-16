@@ -7,4 +7,3 @@ build/
 .idea/
 android/local.properties
 android/.gradle/
-android/app/google-services.json

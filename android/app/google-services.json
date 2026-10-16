@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "117651052291",
+    "project_id": "shruti-uk-chat",
+    "storage_bucket": "shruti-uk-chat.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:117651052291:android:657e9e479e3a8ae08e3b36",
+        "android_client_info": {
+          "package_name": "com.shrutiuk.chat"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDEln3T5gF-XUjB1KzPUi8xtX9prsbb4e8"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
