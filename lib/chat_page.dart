@@ -1,14 +1,16 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:firebase_storage/firebase_storage.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import 'package:intl/intl.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:video_player/video_player.dart';
+import 'config.dart';
 
 class ChatPage extends StatefulWidget {
   final String receiverId;
@@ -29,10 +31,76 @@ class _ChatPageState extends State<ChatPage> {
     return ids.join('_');
   }
 
-  Future<void> sendMessage({String? text, String? fileUrl, String? type, String? fileName}) async {
+  Future<String?> uploadToTelegram(File file, String type) async {
+    try {
+      String endpoint;
+      String fileField;
+      if (type == 'image') {
+        endpoint = 'sendPhoto';
+        fileField = 'photo';
+      } else if (type == 'video') {
+        endpoint = 'sendVideo';
+        fileField = 'video';
+      } else {
+        endpoint = 'sendDocument';
+        fileField = 'document';
+      }
+
+      final uri = Uri.parse('https://api.telegram.org/bot$TG_TOKEN/$endpoint');
+      final request = http.MultipartRequest('POST', uri);
+      request.fields['chat_id'] = TG_CHAT_ID;
+      request.files.add(await http.MultipartFile.fromPath(fileField, file.path));
+
+      final streamed = await request.send();
+      final response = await http.Response.fromStream(streamed);
+
+      if (response.statusCode != 200) {
+        debugPrint('TG upload failed: ${response.body}');
+        return null;
+      }
+
+      final data = jsonDecode(response.body);
+      if (data['ok'] != true) return null;
+
+      String? fileId;
+      final result = data['result'];
+      if (type == 'image' && result['photo'] != null) {
+        final photos = result['photo'] as List;
+        fileId = photos.last['file_id'];
+      } else if (type == 'video' && result['video'] != null) {
+        fileId = result['video']['file_id'];
+      } else if (result['document'] != null) {
+        fileId = result['document']['file_id'];
+      }
+
+      if (fileId == null) return null;
+
+      final getFileUri = Uri.parse(
+          'https://api.telegram.org/bot$TG_TOKEN/getFile?file_id=$fileId');
+      final fileResp = await http.get(getFileUri);
+      final fileData = jsonDecode(fileResp.body);
+      if (fileData['ok'] != true) return null;
+
+      final filePath = fileData['result']['file_path'];
+      return 'https://api.telegram.org/file/bot$TG_TOKEN/$filePath';
+    } catch (e) {
+      debugPrint('TG error: $e');
+      return null;
+    }
+  }
+
+  Future<void> sendMessage({
+    String? text,
+    String? fileUrl,
+    String? type,
+    String? fileName,
+  }) async {
     if ((text == null || text.trim().isEmpty) && fileUrl == null) return;
     await FirebaseFirestore.instance
-        .collection('chats').doc(chatId).collection('messages').add({
+        .collection('chats')
+        .doc(chatId)
+        .collection('messages')
+        .add({
       'senderId': me.uid,
       'receiverId': widget.receiverId,
       'text': text ?? '',
@@ -47,22 +115,27 @@ class _ChatPageState extends State<ChatPage> {
   Future<void> uploadAndSend(File file, String name, String type) async {
     setState(() => uploading = true);
     try {
-      final ref = FirebaseStorage.instance.ref(
-          'chat_files/${DateTime.now().millisecondsSinceEpoch}_$name');
-      await ref.putFile(file);
-      final url = await ref.getDownloadURL();
-      await sendMessage(fileUrl: url, type: type, fileName: name);
+      final url = await uploadToTelegram(file, type);
+      if (url != null) {
+        await sendMessage(fileUrl: url, type: type, fileName: name);
+      } else {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+              content: Text('Upload fail. 20MB se chhoti file try karo.')));
+        }
+      }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text('Upload fail: $e')));
+        ScaffoldMessenger.of(context)
+            .showSnackBar(SnackBar(content: Text('Upload fail: $e')));
       }
     }
     setState(() => uploading = false);
   }
 
   Future<void> pickImage() async {
-    final x = await ImagePicker().pickImage(source: ImageSource.gallery);
+    final x = await ImagePicker()
+        .pickImage(source: ImageSource.gallery, imageQuality: 65);
     if (x == null) return;
     await uploadAndSend(File(x.path), x.name, 'image');
   }
@@ -89,18 +162,24 @@ class _ChatPageState extends State<ChatPage> {
       appBar: AppBar(title: Text(widget.receiverEmail)),
       body: Column(
         children: [
-          if (uploading) const LinearProgressIndicator(color: Color(0xFFE91E63)),
+          if (uploading)
+            const LinearProgressIndicator(color: Color(0xFFE91E63)),
           Expanded(
             child: StreamBuilder<QuerySnapshot>(
               stream: FirebaseFirestore.instance
-                  .collection('chats').doc(chatId).collection('messages')
-                  .orderBy('time', descending: true).snapshots(),
+                  .collection('chats')
+                  .doc(chatId)
+                  .collection('messages')
+                  .orderBy('time', descending: true)
+                  .snapshots(),
               builder: (context, snap) {
                 if (!snap.hasData) {
                   return const Center(child: CircularProgressIndicator());
                 }
                 final docs = snap.data!.docs;
-                if (docs.isEmpty) return const Center(child: Text('Message bhejo 👋'));
+                if (docs.isEmpty) {
+                  return const Center(child: Text('Message bhejo 👋'));
+                }
                 return ListView.builder(
                   reverse: true,
                   itemCount: docs.length,
@@ -123,13 +202,23 @@ class _ChatPageState extends State<ChatPage> {
         ? DateFormat('hh:mm a').format((m['time'] as Timestamp).toDate())
         : '';
     final type = m['type'] ?? 'text';
+
     Widget content;
     if (type == 'image') {
       content = GestureDetector(
         onTap: () => openFile(m['fileUrl']),
         child: ClipRRect(
           borderRadius: BorderRadius.circular(8),
-          child: CachedNetworkImage(imageUrl: m['fileUrl'], width: 220),
+          child: CachedNetworkImage(
+            imageUrl: m['fileUrl'],
+            width: 220,
+            placeholder: (_, __) => const SizedBox(
+                width: 220,
+                height: 150,
+                child: Center(child: CircularProgressIndicator())),
+            errorWidget: (_, __, ___) => const SizedBox(
+                width: 220, height: 100, child: Icon(Icons.broken_image)),
+          ),
         ),
       );
     } else if (type == 'video') {
@@ -137,9 +226,15 @@ class _ChatPageState extends State<ChatPage> {
         onTap: () => Navigator.push(context,
             MaterialPageRoute(builder: (_) => VideoPlayerPage(url: m['fileUrl']))),
         child: Container(
-          width: 220, height: 140,
-          color: Colors.black87,
-          child: const Icon(Icons.play_circle_fill, color: Colors.white, size: 60),
+          width: 220,
+          height: 140,
+          decoration: BoxDecoration(
+            color: Colors.black87,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: const Center(
+            child: Icon(Icons.play_circle_fill, color: Colors.white, size: 60),
+          ),
         ),
       );
     } else if (type == 'file') {
@@ -148,12 +243,17 @@ class _ChatPageState extends State<ChatPage> {
         child: Row(mainAxisSize: MainAxisSize.min, children: [
           const Icon(Icons.insert_drive_file, color: Colors.blue, size: 32),
           const SizedBox(width: 8),
-          Flexible(child: Text(m['fileName'] ?? 'file', overflow: TextOverflow.ellipsis)),
+          ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 180),
+            child: Text(m['fileName'] ?? 'file',
+                overflow: TextOverflow.ellipsis),
+          ),
         ]),
       );
     } else {
-      content = Text(m['text'] ?? '');
+      content = Text(m['text'] ?? '', style: const TextStyle(fontSize: 15));
     }
+
     return Align(
       alignment: isMe ? Alignment.centerRight : Alignment.centerLeft,
       child: Container(
@@ -162,13 +262,22 @@ class _ChatPageState extends State<ChatPage> {
         decoration: BoxDecoration(
           color: isMe ? const Color(0xFFFCE4EC) : Colors.white,
           borderRadius: BorderRadius.circular(12),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.06),
+              blurRadius: 3,
+              offset: const Offset(0, 1),
+            ),
+          ],
         ),
         child: Column(
-          crossAxisAlignment: isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+          crossAxisAlignment:
+              isMe ? CrossAxisAlignment.end : CrossAxisAlignment.start,
           children: [
             content,
             const SizedBox(height: 4),
-            Text(time, style: const TextStyle(fontSize: 10, color: Colors.black54)),
+            Text(time,
+                style: const TextStyle(fontSize: 10, color: Colors.black54)),
           ],
         ),
       ),
@@ -184,28 +293,39 @@ class _ChatPageState extends State<ChatPage> {
           children: [
             IconButton(
               icon: const Icon(Icons.attach_file, color: Color(0xFFE91E63)),
-              onPressed: uploading ? null : () {
-                showModalBottomSheet(
-                  context: context,
-                  builder: (_) => Wrap(children: [
-                    ListTile(
-                      leading: const Icon(Icons.image, color: Colors.purple),
-                      title: const Text('Photo'),
-                      onTap: () { Navigator.pop(context); pickImage(); },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.videocam, color: Colors.red),
-                      title: const Text('Video'),
-                      onTap: () { Navigator.pop(context); pickVideo(); },
-                    ),
-                    ListTile(
-                      leading: const Icon(Icons.picture_as_pdf, color: Colors.blue),
-                      title: const Text('File / PDF'),
-                      onTap: () { Navigator.pop(context); pickFile(); },
-                    ),
-                  ]),
-                );
-              },
+              onPressed: uploading
+                  ? null
+                  : () {
+                      showModalBottomSheet(
+                        context: context,
+                        builder: (_) => Wrap(children: [
+                          ListTile(
+                            leading: const Icon(Icons.image, color: Colors.purple),
+                            title: const Text('Photo'),
+                            onTap: () {
+                              Navigator.pop(context);
+                              pickImage();
+                            },
+                          ),
+                          ListTile(
+                            leading: const Icon(Icons.videocam, color: Colors.red),
+                            title: const Text('Video'),
+                            onTap: () {
+                              Navigator.pop(context);
+                              pickVideo();
+                            },
+                          ),
+                          ListTile(
+                            leading: const Icon(Icons.picture_as_pdf, color: Colors.blue),
+                            title: const Text('File / PDF'),
+                            onTap: () {
+                              Navigator.pop(context);
+                              pickFile();
+                            },
+                          ),
+                        ]),
+                      );
+                    },
             ),
             Expanded(
               child: TextField(
@@ -240,10 +360,18 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
   void initState() {
     super.initState();
     _ctrl = VideoPlayerController.networkUrl(Uri.parse(widget.url))
-      ..initialize().then((_) { setState(() {}); _ctrl.play(); });
+      ..initialize().then((_) {
+        setState(() {});
+        _ctrl.play();
+      });
   }
+
   @override
-  void dispose() { _ctrl.dispose(); super.dispose(); }
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -251,12 +379,16 @@ class _VideoPlayerPageState extends State<VideoPlayerPage> {
       appBar: AppBar(backgroundColor: Colors.black, foregroundColor: Colors.white),
       body: Center(
         child: _ctrl.value.isInitialized
-            ? AspectRatio(aspectRatio: _ctrl.value.aspectRatio, child: VideoPlayer(_ctrl))
+            ? AspectRatio(
+                aspectRatio: _ctrl.value.aspectRatio,
+                child: VideoPlayer(_ctrl),
+              )
             : const CircularProgressIndicator(),
       ),
       floatingActionButton: FloatingActionButton(
         backgroundColor: const Color(0xFFE91E63),
-        onPressed: () => setState(() => _ctrl.value.isPlaying ? _ctrl.pause() : _ctrl.play()),
+        onPressed: () => setState(
+            () => _ctrl.value.isPlaying ? _ctrl.pause() : _ctrl.play()),
         child: Icon(_ctrl.value.isPlaying ? Icons.pause : Icons.play_arrow),
       ),
     );
